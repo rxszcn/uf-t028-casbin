@@ -91,12 +91,15 @@ func (a *FilteredAdapter) loadFilteredPolicyFile(model model.Model, filter *Filt
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
 
-		if filterLine(line, filter) {
+		skip, err := filterLine(line, filter)
+		if err != nil {
+			return err
+		}
+		if skip {
 			continue
 		}
 
-		err = handler(line, model)
-		if err != nil {
+		if err = handler(line, model); err != nil {
 			return err
 		}
 	}
@@ -116,16 +119,30 @@ func (a *FilteredAdapter) SavePolicy(model model.Model) error {
 	return a.Adapter.SavePolicy(model)
 }
 
-func filterLine(line string, filter *Filter) bool {
+// filterLine reports whether the line must be skipped because it does not
+// match the filter. The line is split with the same CSV parser as the full
+// load and the save side (persist.ParsePolicyLine via persist.MatchPolicyLine),
+// so fields quoted because they contain commas or quotes are treated as a
+// single field instead of being silently split out of alignment.
+//
+// A line that cannot be parsed returns an error and aborts the load, mirroring
+// LoadPolicyLine; it is never silently filtered or loaded with shifted fields.
+func filterLine(line string, filter *Filter) (bool, error) {
 	if filter == nil {
-		return false
+		return false, nil
 	}
-	p := strings.Split(line, ",")
-	if len(p) == 0 {
-		return true
+
+	tokens, err := persist.ParsePolicyLine(line)
+	if err != nil {
+		return false, err
 	}
+	if len(tokens) == 0 {
+		// Blank or comment line: nothing to filter, let the handler ignore it.
+		return false, nil
+	}
+
 	var filterSlice []string
-	switch strings.TrimSpace(p[0]) {
+	switch strings.TrimSpace(tokens[0]) {
 	case "p":
 		filterSlice = filter.P
 	case "g":
@@ -141,19 +158,11 @@ func filterLine(line string, filter *Filter) bool {
 	case "g5":
 		filterSlice = filter.G5
 	}
-	return filterWords(p, filterSlice)
-}
 
-func filterWords(line []string, filter []string) bool {
-	if len(line) < len(filter)+1 {
-		return true
+	match, err := persist.MatchPolicyLine(line, filterSlice)
+	if err != nil {
+		return false, err
 	}
-	var skipLine bool
-	for i, v := range filter {
-		if len(v) > 0 && strings.TrimSpace(v) != strings.TrimSpace(line[i+1]) {
-			skipLine = true
-			break
-		}
-	}
-	return skipLine
+	// Skip lines that do not match; keep (return false) the matching lines.
+	return !match, nil
 }

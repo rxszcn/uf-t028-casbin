@@ -22,6 +22,7 @@ import (
 	"encoding/csv"
 	"errors"
 	"fmt"
+	"io"
 	"strings"
 
 	"github.com/casbin/casbin/v3/model"
@@ -29,8 +30,32 @@ import (
 
 // LoadPolicyLine loads a text line as a policy rule to model.
 func LoadPolicyLine(line string, m model.Model) error {
-	if line == "" || strings.HasPrefix(line, "#") {
+	tokens, err := ParsePolicyLine(line)
+	if err != nil {
+		return err
+	}
+	// A blank or comment line yields no tokens; there is nothing to load.
+	if tokens == nil {
 		return nil
+	}
+
+	return LoadPolicyArray(tokens, m)
+}
+
+// ParsePolicyLine splits one physical policy line into its fields using the
+// same CSV semantics as the save side (PolicyLineToCsv). Quoted fields may
+// therefore contain commas, and doubled quotes ("") inside a quoted field are
+// unescaped to a single quote. Sharing this parser between the full load, the
+// filtered load and the save side guarantees that a line is split into exactly
+// the same fields in every code path.
+//
+// A blank line or a line whose first non-space character is '#' yields
+// (nil, nil): it carries no rule and must simply be ignored. Any other line
+// that cannot be parsed as a single CSV record yields an error, so that a
+// corrupt policy file fails loudly instead of silently shifting fields.
+func ParsePolicyLine(line string) ([]string, error) {
+	if strings.TrimSpace(line) == "" || strings.HasPrefix(line, "#") {
+		return nil, nil
 	}
 
 	r := csv.NewReader(strings.NewReader(line))
@@ -39,11 +64,49 @@ func LoadPolicyLine(line string, m model.Model) error {
 	r.TrimLeadingSpace = true
 
 	tokens, err := r.Read()
+	if err == io.EOF {
+		return nil, nil
+	}
 	if err != nil {
-		return err
+		return nil, err
+	}
+	return tokens, nil
+}
+
+// MatchPolicyLine reports whether the fields of a policy line match the given
+// filter words. The line is parsed with ParsePolicyLine, i.e. with the exact
+// same semantics as the full load and the save side, so quoted commas and
+// escaped quotes never shift the compared fields.
+//
+// filter holds the words to compare against the rule fields after the policy
+// type: empty words are ignored, every non-empty word must equal the field at
+// the same position (leading/trailing spaces are ignored on both sides, as in
+// the historical filtered-adapter behaviour). A line shorter than the filter
+// does not match.
+//
+// Blank lines and comment lines never match (they return false). A line that
+// cannot be parsed returns an error, leaving the decision to abort the load to
+// the caller rather than silently dropping or misrouting the rule.
+func MatchPolicyLine(line string, filter []string) (bool, error) {
+	tokens, err := ParsePolicyLine(line)
+	if err != nil {
+		return false, err
+	}
+	if len(tokens) == 0 {
+		return false, nil
 	}
 
-	return LoadPolicyArray(tokens, m)
+	// tokens[0] is the policy type (p, g, ...); the rule fields follow.
+	rule := tokens[1:]
+	if len(rule) < len(filter) {
+		return false, nil
+	}
+	for i, word := range filter {
+		if word != "" && strings.TrimSpace(word) != strings.TrimSpace(rule[i]) {
+			return false, nil
+		}
+	}
+	return true, nil
 }
 
 // PolicyLineToCsv serializes a policy type and its rule fields into a CSV-safe line.
